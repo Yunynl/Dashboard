@@ -177,15 +177,20 @@
 
             <div class="card full-width">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-                    <span class="metric-label">1-MIN AGGREGATED DATA</span>
+                    <span class="metric-label" id="min-table-label">1-MIN AGGREGATED DATA</span>
                     <span class="metric-sub" id="min-table-count">--</span>
                 </div>
-                <div style="display:flex; gap:8px; margin-bottom:10px; align-items:center;">
+                <div style="display:flex; gap:8px; margin-bottom:10px; align-items:center; flex-wrap:wrap;">
                     <span class="metric-sub" style="margin-right:4px;">Filter:</span>
                     <button id="min-filter-ALL" class="btn btn-secondary" style="padding:3px 10px; font-size:0.75rem; opacity:1;" onclick="UI.setMinTableFilter('ALL')">All</button>
                     <button id="min-filter-CHARGING" class="btn btn-secondary" style="padding:3px 10px; font-size:0.75rem; opacity:0.4; color:var(--accent-success); border-color:var(--accent-success);" onclick="UI.setMinTableFilter('CHARGING')">Charging</button>
                     <button id="min-filter-DISCHARGING" class="btn btn-secondary" style="padding:3px 10px; font-size:0.75rem; opacity:0.4; color:var(--accent-danger); border-color:var(--accent-danger);" onclick="UI.setMinTableFilter('DISCHARGING')">Discharging</button>
                     <button id="min-filter-IDLE" class="btn btn-secondary" style="padding:3px 10px; font-size:0.75rem; opacity:0.4;" onclick="UI.setMinTableFilter('IDLE')">Idle</button>
+                    <span style="margin-left:12px; color:var(--text-dim); font-size:0.75rem;">Window:</span>
+                    <input id="min-window-input" type="number" min="1" max="120" value="1"
+                        style="width:52px; background:var(--bg-panel); color:var(--text-main); border:1px solid var(--border); border-radius:4px; padding:2px 5px; font-size:0.8rem;"
+                        onchange="UI.setMinTableWindow(this.value)">
+                    <span style="color:var(--text-dim); font-size:0.75rem;">min</span>
                 </div>
                 <div style="max-height: 300px; overflow-y: auto;">
                     <table class="data-table">

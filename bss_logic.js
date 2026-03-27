@@ -38,7 +38,8 @@ let AppState = {
     cycleChartInstance: null,
     selectedCycleBySlot: {},
     analysisStats: null,
-    minTableFilter: 'ALL'
+    minTableFilter: 'ALL',
+    minTableWindow: 1
 };
 let alertSent = false;
 const ROWS_PER_PAGE = 50;
@@ -244,10 +245,21 @@ const Physics = {
     },
 
     interpolateReferencePoint: (packCfg, targetSoc) => {
+        const REF_SERIES = 17; // reference profile was recorded on a 17S pack
+        const seriesScale = (packCfg && packCfg.series > 0) ? (packCfg.series / REF_SERIES) : 1;
+
+        const scalePoint = (pt) => ({
+            ...pt,
+            voltageV: pt.voltageV * seriesScale,
+            powerW:   pt.powerW   * seriesScale,
+            cumWh:    pt.cumWh    * seriesScale,
+            // cumAh and currentA don't scale with series count
+        });
+
         const points = Physics.getReferenceTelemetry(packCfg);
         if (!points.length || !Number.isFinite(targetSoc)) return null;
         const sorted = [...points].sort((a, b) => a.soc - b.soc);
-        if (targetSoc <= sorted[0].soc) return { ...sorted[0] };
+        if (targetSoc <= sorted[0].soc) return scalePoint({ ...sorted[0] });
         if (targetSoc >= sorted[sorted.length - 1].soc) {
             const last = sorted[sorted.length - 1];
             const fullWh = (typeof packCfg.referenceFullWh === 'number' && packCfg.referenceFullWh > last.cumWh)
@@ -255,23 +267,23 @@ const Physics = {
             const fullAh = (typeof packCfg.referenceFullAh === 'number' && packCfg.referenceFullAh > last.cumAh)
                 ? packCfg.referenceFullAh : last.cumAh;
             const remainSoc = 100 - last.soc;
-            if (remainSoc <= 0) return { ...last };
+            if (remainSoc <= 0) return scalePoint({ ...last });
             const ratio = Math.min(1, (targetSoc - last.soc) / remainSoc);
-            return {
+            return scalePoint({
                 ...last,
                 soc: targetSoc,
                 cumWh: last.cumWh + ratio * (fullWh - last.cumWh),
                 cumAh: last.cumAh + ratio * (fullAh - last.cumAh)
-            };
+            });
         }
         for (let i = 1; i < sorted.length; i++) {
             const a = sorted[i - 1];
             const b = sorted[i];
             if (targetSoc >= a.soc && targetSoc <= b.soc) {
-                if (b.soc === a.soc) return { ...a };
+                if (b.soc === a.soc) return scalePoint({ ...a });
                 const ratio = (targetSoc - a.soc) / (b.soc - a.soc);
                 const lerp = (x, y) => x + (y - x) * ratio;
-                return {
+                return scalePoint({
                     timeS: lerp(a.timeS, b.timeS),
                     soc: targetSoc,
                     voltageV: lerp(a.voltageV, b.voltageV),
@@ -279,10 +291,10 @@ const Physics = {
                     powerW: lerp(a.powerW, b.powerW),
                     cumAh: lerp(a.cumAh, b.cumAh),
                     cumWh: lerp(a.cumWh, b.cumWh)
-                };
+                });
             }
         }
-        return { ...sorted[sorted.length - 1] };
+        return scalePoint({ ...sorted[sorted.length - 1] });
     },
 
     referenceDeltaForSocWindow: (packCfg, startSoc, endSoc) => {
@@ -475,15 +487,20 @@ const Physics = {
         return Math.max(0, Math.min(100, soc));
     },
 
-    // Bucket raw 5-second telemetry into 1-minute intervals for cleaner SOC comparison.
+    // Bucket raw 5-second telemetry into N-minute intervals for cleaner SOC comparison.
     // Returns array sorted oldest→newest.
-    aggregateToMinutes: (history) => {
+    aggregateToMinutes: (history, windowMin = 1) => {
         if (!history || history.length === 0) return [];
+        const w = Math.max(1, Math.floor(windowMin));
         const buckets = new Map();
         history.forEach(entry => {
             const d = new Date(entry.timestamp);
+            const totalMin = d.getHours() * 60 + d.getMinutes();
+            const bucketMin = Math.floor(totalMin / w) * w;
+            const h = Math.floor(bucketMin / 60);
+            const m = bucketMin % 60;
             const key = `${(d.getMonth()+1).toString().padStart(2,'0')}/${d.getDate().toString().padStart(2,'0')} `
-                      + `${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+                      + `${h.toString().padStart(2,'0')}:${m.toString().padStart(2,'0')}`;
             if (!buckets.has(key)) buckets.set(key, []);
             buckets.get(key).push(entry);
         });
@@ -1713,16 +1730,44 @@ const UI = {
         ).join('');
 
 
-        document.getElementById('pack-list').innerHTML = SYSTEM_CONFIG.packs.map(p =>
-            `<div class="flex-row" style="margin-bottom:5px;">
-                <input value="${p.name}" onchange="UI.updateCfg('packs','${p.id}','name',this.value)" placeholder="Pack Name">
-                <select onchange="UI.updateCfg('packs','${p.id}','cellId',this.value)">${SYSTEM_CONFIG.cells.map(c => `<option value="${c.id}" ${c.id === p.cellId ? 'selected' : ''}>${c.name}</option>`).join('')}</select>
-                <input type="number" value="${p.series}" onchange="UI.updateCfg('packs','${p.id}','series',this.value)" placeholder="Series">
-                <input type="number" value="${p.mfgAh}" onchange="UI.updateCfg('packs','${p.id}','mfgAh',this.value)" placeholder="Total Ah">
-                <input type="number" value="${p.referenceFullWh || ""}" onchange="UI.updateCfg('packs','${p.id}','referenceFullWh',this.value)" placeholder="Ref Full Wh">
-                <button class="btn-secondary" style="color:var(--accent-red); border-color:var(--accent-red);" onclick="UI.removeCfg('packs','${p.id}')">&times;</button>
-            </div>`
-        ).join('');
+        document.getElementById('pack-list').innerHTML = SYSTEM_CONFIG.packs.map(p => {
+            const cellCfg = SYSTEM_CONFIG.cells.find(c => c.id === p.cellId) || SYSTEM_CONFIG.cells[0];
+            const REF_SERIES = 17;
+            const calcVMin    = cellCfg ? (cellCfg.vMin * p.series).toFixed(1) : '—';
+            const calcVMax    = cellCfg ? (cellCfg.vMax * p.series).toFixed(1) : '—';
+            const calcIdealWh = cellCfg ? (p.mfgAh * cellCfg.vMax * p.series).toFixed(1) : '—';
+            const calcRefWh   = (HARD_CODED_REFERENCE_PROFILE.estimatedFullWh * (p.series / REF_SERIES)).toFixed(2);
+            const calcRefAh   = (HARD_CODED_REFERENCE_PROFILE.estimatedFullAh * (p.series / REF_SERIES)).toFixed(4);
+            // Auto-sync the stored value so interpolation is always correct
+            p.referenceFullWh = parseFloat(calcRefWh);
+            p.referenceFullAh = parseFloat(calcRefAh);
+            return `<div style="margin-bottom:10px; padding:8px; background:var(--bg-secondary,#161b22); border-radius:6px; border:1px solid #30363d;">
+                <div class="flex-row" style="margin-bottom:6px; gap:6px; flex-wrap:wrap;">
+                    <input value="${p.name}" onchange="UI.updateCfg('packs','${p.id}','name',this.value)" placeholder="Pack Name" style="flex:2; min-width:100px;">
+                    <select onchange="UI.updateCfg('packs','${p.id}','cellId',this.value); UI.renderConfigLists();" style="flex:1.5; min-width:100px;">${SYSTEM_CONFIG.cells.map(c => `<option value="${c.id}" ${c.id === p.cellId ? 'selected' : ''}>${c.name}</option>`).join('')}</select>
+                    <label style="display:flex;flex-direction:column;font-size:11px;color:#8b949e;flex:1;min-width:70px;">Series
+                        <input type="number" min="1" value="${p.series}" onchange="UI.updateCfg('packs','${p.id}','series',+this.value); UI.renderConfigLists();" style="width:100%;">
+                    </label>
+                    <label style="display:flex;flex-direction:column;font-size:11px;color:#8b949e;flex:1;min-width:70px;">Total Ah
+                        <input type="number" min="1" value="${p.mfgAh}" onchange="UI.updateCfg('packs','${p.id}','mfgAh',+this.value); UI.renderConfigLists();" style="width:100%;">
+                    </label>
+                    <label style="display:flex;flex-direction:column;font-size:11px;color:#8b949e;flex:1;min-width:70px; opacity:0.45;" title="⚠️ This field is no longer used. Ref Full Wh is now auto-calculated from the Series count. Editing this has no effect.">
+                        <span style="text-decoration:line-through;">Ref Full Wh</span>
+                        <input type="number" value="${p._legacyRefWh || ''}" placeholder="(disabled)" disabled style="width:100%; cursor:not-allowed; background:#1c1c1c; color:#555; border-color:#333;">
+                    </label>
+                    <button class="btn-secondary" style="color:var(--accent-red); border-color:var(--accent-red); align-self:flex-end;" onclick="UI.removeCfg('packs','${p.id}')">&times;</button>
+                </div>
+                <div style="display:flex; gap:10px; flex-wrap:wrap; font-size:12px; padding:6px 4px; background:#0d1117; border-radius:4px; border:1px solid #21262d;">
+                    <span title="Calculated from cellVMin × Series">⚡ V range: <b style="color:#39c5cf;">${calcVMin} – ${calcVMax} V</b></span>
+                    <span title="mfgAh × cellVMax × Series">🔋 Ideal: <b style="color:#39c5cf;">${calcIdealWh} Wh</b></span>
+                    <span title="Auto-scaled from 17S reference (936.38 Wh × series/17)">📐 Ref Full Wh <span style="font-size:10px; color:#555;">(auto × ${p.series}/${REF_SERIES})</span>: <b style="color:#f0a500;">${calcRefWh} Wh</b></span>
+                    <span title="Auto-scaled from 17S reference (14.016 Ah × series/17)">📐 Ref Full Ah: <b style="color:#f0a500;">${calcRefAh} Ah</b></span>
+                </div>
+                <div style="font-size:11px; color:#b08030; margin-top:5px; padding:3px 6px; background:#2a1f00; border-radius:3px; border-left:3px solid #f0a500;">
+                    ⚠️ "Ref Full Wh" manual input is disabled — value is now auto-calculated based on Series count relative to the 17S reference profile.
+                </div>
+            </div>`;
+        }).join('');
 
 
         document.getElementById('slot-list').innerHTML = SYSTEM_CONFIG.slots.map(s =>
@@ -1737,7 +1782,17 @@ const UI = {
             </div>`
         ).join('');
     },
-    updateCfg: (type, id, key, val) => { const item = SYSTEM_CONFIG[type].find(x => x.id == id); if (item) item[key] = isNaN(val) ? val : parseFloat(val); },
+    updateCfg: (type, id, key, val) => {
+        const item = SYSTEM_CONFIG[type].find(x => x.id == id);
+        if (!item) return;
+        item[key] = isNaN(val) ? val : parseFloat(val);
+        // Auto-recalculate reference Wh/Ah whenever series count changes on a pack
+        if (type === 'packs' && (key === 'series' || key === 'cellId')) {
+            const REF_SERIES = 17;
+            item.referenceFullWh = parseFloat((HARD_CODED_REFERENCE_PROFILE.estimatedFullWh * (item.series / REF_SERIES)).toFixed(2));
+            item.referenceFullAh = parseFloat((HARD_CODED_REFERENCE_PROFILE.estimatedFullAh * (item.series / REF_SERIES)).toFixed(4));
+        }
+    },
     removeCfg: (type, id) => { SYSTEM_CONFIG[type] = SYSTEM_CONFIG[type].filter(x => x.id != id); UI.renderConfigLists(); },
     addCellType: () => { SYSTEM_CONFIG.cells.push({ id: 'c' + Date.now(), name: 'New Cell', vMin: 3.0, vMax: 4.2, ah: 2.5 }); UI.renderConfigLists(); },
     addPackConfig: () => { SYSTEM_CONFIG.packs.push({ id: 'p' + Date.now(), name: 'New Pack', cellId: SYSTEM_CONFIG.cells[0]?.id, series: 1, mfgAh: 10, referenceFullWh: null, referenceSocWhCurve: [] }); UI.renderConfigLists(); },
@@ -1755,6 +1810,17 @@ const UI = {
         if (slotId) UI.renderMinuteTable(slotId);
     },
 
+    setMinTableWindow: (val) => {
+        const n = Math.max(1, Math.min(120, parseInt(val) || 1));
+        AppState.minTableWindow = n;
+        const input = document.getElementById('min-window-input');
+        if (input) input.value = n;
+        const label = document.getElementById('min-table-label');
+        if (label) label.textContent = `${n}-MIN AGGREGATED DATA`;
+        const slotId = Number(document.getElementById('min-table-body')?.dataset?.slotId);
+        if (slotId) UI.renderMinuteTable(slotId);
+    },
+
     renderMinuteTable: (id) => {
         const d = AppState.processedData[id];
         const tbody = document.getElementById('min-table-body');
@@ -1762,7 +1828,8 @@ const UI = {
         if (!d || !tbody) return;
         tbody.dataset.slotId = id;
         const filter = AppState.minTableFilter || 'ALL';
-        const allRows = Physics.aggregateToMinutes(d.history);
+        const window = AppState.minTableWindow || 1;
+        const allRows = Physics.aggregateToMinutes(d.history, window);
         const filtered = filter === 'ALL' ? allRows : allRows.filter(r => r.status === filter);
         tbody.innerHTML = '';
         // Show latest 300 minutes (most recent first)
